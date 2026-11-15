@@ -1,0 +1,17 @@
+{
+  "name": "colab",
+  "version": "1.1.0",
+  "description": "Work in Google Colab notebooks open in your browser: read, add, edit and run cells from Claude Code.",
+  "author": { "name": "kjslag" },
+  "homepage": "https://github.com/kjslag/colab-mcp",
+  "repository": "https://github.com/kjslag/colab-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["colab", "jupyter", "notebook", "mcp"],
+  "mcpServers": {
+    "colab": {
+      "command": "uv",
+      "args": ["run", "--frozen", "--no-dev", "--quiet", "--directory", "${CLAUDE_PLUGIN_ROOT}", "colab-mcp"],
+      "env": { "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv" }
+    }
+  }
+}
