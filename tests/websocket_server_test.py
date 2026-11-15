@@ -17,11 +17,14 @@ from colab_mcp.websocket_server import ColabWebSocketServer
 from mcp.types import JSONRPCRequest, JSONRPCResponse, JSONRPCMessage
 from mcp.shared.message import SessionMessage
 import pytest
+from unittest.mock import AsyncMock, Mock, patch
 import websockets
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("origin_domain", ["https://colab.google.com", "https://colab.research.google.com"])
+@pytest.mark.parametrize(
+    "origin_domain", ["https://colab.google.com", "https://colab.research.google.com"]
+)
 async def test_successful_connection(origin_domain):
     async with ColabWebSocketServer() as server:
         client = await websockets.connect(
@@ -219,3 +222,31 @@ async def test_token_in_url():
 
         assert not server.connection_live.is_set()
         assert not server.connection_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_binds_a_single_ipv4_loopback_socket():
+    async with ColabWebSocketServer() as server:
+        assert server.host == "127.0.0.1"
+        addresses = [sock.getsockname()[:2] for sock in server._server.sockets]
+        assert addresses == [("127.0.0.1", server.port)]
+
+
+@pytest.mark.asyncio
+async def test_refuses_a_host_that_binds_two_ports():
+    # What "localhost" does on a machine where it resolves to 127.0.0.1 and ::1.
+    fake_server = Mock()
+    fake_server.sockets = [
+        Mock(**{"getsockname.return_value": ("::1", 50001, 0, 0)}),
+        Mock(**{"getsockname.return_value": ("127.0.0.1", 50002)}),
+    ]
+    fake_server.wait_closed = AsyncMock()
+    with patch(
+        "colab_mcp.websocket_server.websockets.serve",
+        AsyncMock(return_value=fake_server),
+    ):
+        with pytest.raises(
+            RuntimeError, match=r"bound 2 sockets on ports \[50001, 50002\]"
+        ):
+            await ColabWebSocketServer(host="localhost").__aenter__()
+    fake_server.close.assert_called_once()

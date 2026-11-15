@@ -1,0 +1,12 @@
+{
+  "name": "kjslag-colab",
+  "description": "Colab notebook plugin for Claude Code",
+  "owner": { "name": "kjslag" },
+  "plugins": [
+    {
+      "name": "colab",
+      "source": "./",
+      "description": "Work in Google Colab notebooks open in your browser: read, add, edit and run cells."
+    }
+  ]
+}
