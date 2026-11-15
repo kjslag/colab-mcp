@@ -39,7 +39,11 @@ class ColabWebSocketServer:
     from a Google Colab session (colab.google.com).
     """
 
-    def __init__(self, host="localhost"):
+    # "localhost" can resolve to both 127.0.0.1 and ::1. Binding port 0 on
+    # both gives each address its own random port, while only one port is
+    # handed to the Colab tab, so the tab can end up dialing a port nothing
+    # listens on. Bind the IPv4 loopback address alone.
+    def __init__(self, host="127.0.0.1"):
         self.host = host
         self.port = 0
         self.connection_lock = asyncio.Lock()
@@ -149,7 +153,17 @@ class ColabWebSocketServer:
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
         )
-        self.port = self._server.sockets[0].getsockname()[1]
+        sockets = self._server.sockets
+        if len(sockets) != 1:
+            ports = sorted({sock.getsockname()[1] for sock in sockets})
+            self._server.close()
+            await self._server.wait_closed()
+            raise RuntimeError(
+                f"Host {self.host!r} bound {len(sockets)} sockets on ports "
+                f"{ports}, but the Colab tab is given a single port. Use a "
+                "host that resolves to one address, such as 127.0.0.1."
+            )
+        self.port = sockets[0].getsockname()[1]
         logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
         return self
 

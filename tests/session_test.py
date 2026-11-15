@@ -14,9 +14,11 @@
 
 import asyncio
 from colab_mcp import session
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import MiddlewareContext
+from mcp.types import CallToolResult, TextContent, Tool as McpTool
 import pytest
-from unittest.mock import patch, AsyncMock, Mock
+from unittest.mock import patch, AsyncMock, MagicMock, Mock
 
 
 @pytest.fixture(autouse=True)
@@ -151,7 +153,7 @@ class TestCheckSessionProxyToolFn:
         ctx.get_state.side_effect = (
             lambda k: True if k == session.FE_CONNECTED_KEY else None
         )
-        assert await session.check_session_proxy_tool_fn(ctx) is True
+        assert await session.check_session_proxy_tool_fn(ctx=ctx) is True
 
     @pytest.mark.asyncio
     async def test_disconnected(self, mock_webbrowser):
@@ -167,11 +169,220 @@ class TestCheckSessionProxyToolFn:
             return None
 
         ctx.get_state.side_effect = get_state
-        assert await session.check_session_proxy_tool_fn(ctx) is False
+        assert await session.check_session_proxy_tool_fn(ctx=ctx) is False
         mock_webbrowser.assert_called_once()
         args, _ = mock_webbrowser.call_args
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
+        assert args[0].startswith(
+            "https://colab.research.google.com/notebooks/empty.ipynb#"
+        )
+
+    @staticmethod
+    def _ctx(connected):
+        ctx = Mock()
+        state = {
+            session.FE_CONNECTED_KEY: connected,
+            session.PROXY_TOKEN_KEY: "test-token",
+            session.PROXY_PORT_KEY: 1234,
+        }
+        ctx.get_state.side_effect = state.get
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_disconnected_opens_notebook_url(self, mock_webbrowser):
+        ctx = self._ctx(connected=False)
+        url = "https://colab.research.google.com/drive/abc123?authuser=1#scrollTo=x"
+        assert (
+            await session.check_session_proxy_tool_fn(notebook_url=url, ctx=ctx)
+            is False
+        )
+        mock_webbrowser.assert_called_once_with(
+            "https://colab.research.google.com/drive/abc123?authuser=1"
+            "#mcpProxyToken=test-token&mcpProxyPort=1234"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bad_notebook_url_is_rejected(self, mock_webbrowser):
+        ctx = self._ctx(connected=False)
+        with pytest.raises(ToolError, match="notebook_url must be an https URL"):
+            await session.check_session_proxy_tool_fn(
+                notebook_url="https://example.com/drive/abc123", ctx=ctx
+            )
+        mock_webbrowser.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_connected_with_notebook_url_is_an_error(self, mock_webbrowser):
+        ctx = self._ctx(connected=True)
+        with pytest.raises(ToolError, match="already connected"):
+            await session.check_session_proxy_tool_fn(
+                notebook_url="https://colab.research.google.com/drive/abc123",
+                ctx=ctx,
+            )
+        mock_webbrowser.assert_not_called()
+
+
+class TestBuildConnectionUrl:
+    def test_scratch_by_default(self):
+        assert session.build_connection_url("tok", 99) == (
+            "https://colab.research.google.com/notebooks/empty.ipynb"
+            "#mcpProxyToken=tok&mcpProxyPort=99"
+        )
+
+    @pytest.mark.parametrize(
+        "notebook_url, expected_base",
+        [
+            (
+                "https://colab.research.google.com/drive/abc123",
+                "https://colab.research.google.com/drive/abc123",
+            ),
+            (
+                "  https://Colab.Research.Google.com/drive/abc123  ",
+                "https://colab.research.google.com/drive/abc123",
+            ),
+            (
+                "https://colab.google.com/drive/abc123",
+                "https://colab.google.com/drive/abc123",
+            ),
+            (
+                "https://colab.research.google.com/github/o/r/blob/main/a%20b.ipynb",
+                "https://colab.research.google.com/github/o/r/blob/main/a%20b.ipynb",
+            ),
+            (
+                "https://colab.research.google.com/drive/abc123?authuser=1&usp=sharing",
+                "https://colab.research.google.com/drive/abc123?authuser=1&usp=sharing",
+            ),
+            (
+                # an existing fragment is replaced, including a stale token
+                "https://colab.research.google.com/drive/abc123#mcpProxyToken=old&mcpProxyPort=1",
+                "https://colab.research.google.com/drive/abc123",
+            ),
+            (
+                # characters that could break out of a quoted string are encoded
+                'https://colab.research.google.com/drive/a"b\\c d',
+                "https://colab.research.google.com/drive/a%22b%5Cc%20d",
+            ),
+        ],
+    )
+    def test_existing_notebook(self, notebook_url, expected_base):
+        assert session.build_connection_url("tok", 99, notebook_url) == (
+            f"{expected_base}#mcpProxyToken=tok&mcpProxyPort=99"
+        )
+
+    @pytest.mark.parametrize(
+        "notebook_url",
+        [
+            "http://colab.research.google.com/drive/abc123",
+            "https://example.com/drive/abc123",
+            "https://colab.research.google.com.example.com/drive/abc123",
+            "https://colab.research.google.com@example.com/drive/abc123",
+            "https://user@colab.research.google.com/drive/abc123",
+            "https://colab.research.google.com:8443/drive/abc123",
+            "https://example.com/#https://colab.research.google.com/drive/abc123",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "colab.research.google.com/drive/abc123",
+        ],
+    )
+    def test_rejects_urls_off_colab(self, notebook_url):
+        with pytest.raises(ValueError, match="notebook_url must be an https URL"):
+            session.build_connection_url("tok", 99, notebook_url)
+
+
+class TestPassthroughTools:
+    @staticmethod
+    def _tools(proxy_client):
+        return {t.name: t for t in session.make_passthrough_tools(proxy_client)}
+
+    @staticmethod
+    def _connected_proxy_client(mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = MagicMock()
+        mock_proxy_client.proxy_mcp_client.__aenter__ = AsyncMock()
+        mock_proxy_client.proxy_mcp_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_proxy_client.proxy_mcp_client
+
+    def test_names(self, mock_proxy_client):
+        assert set(self._tools(mock_proxy_client)) == {
+            session.LIST_NOTEBOOK_TOOLS_NAME,
+            session.CALL_NOTEBOOK_TOOL_NAME,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name, arguments",
+        [
+            (session.LIST_NOTEBOOK_TOOLS_NAME, {}),
+            (session.CALL_NOTEBOOK_TOOL_NAME, {"name": "get_cells"}),
+        ],
+    )
+    async def test_not_connected(self, mock_proxy_client, name, arguments):
+        tool = self._tools(mock_proxy_client)[name]
+        with pytest.raises(ToolError, match="No Colab tab is connected"):
+            await tool.run(arguments)
+
+    @pytest.mark.asyncio
+    async def test_list_notebook_tools(self, mock_proxy_client):
+        client = self._connected_proxy_client(mock_proxy_client)
+        schema = {"type": "object", "properties": {"code": {"type": "string"}}}
+        client.list_tools = AsyncMock(
+            return_value=[
+                McpTool(name="add_code_cell", description="Adds", inputSchema=schema)
+            ]
+        )
+        tool = self._tools(mock_proxy_client)[session.LIST_NOTEBOOK_TOOLS_NAME]
+
+        result = await tool.run({})
+
+        assert result.structured_content == {
+            "result": [
+                {"name": "add_code_cell", "description": "Adds", "inputSchema": schema}
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_call_notebook_tool(self, mock_proxy_client):
+        client = self._connected_proxy_client(mock_proxy_client)
+        client.call_tool_mcp = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="added")],
+                structuredContent={"cellId": "c1"},
+            )
+        )
+        tool = self._tools(mock_proxy_client)[session.CALL_NOTEBOOK_TOOL_NAME]
+
+        result = await tool.run({"name": "add_code_cell", "arguments": {"code": "1+1"}})
+
+        client.call_tool_mcp.assert_called_once_with(
+            name="add_code_cell", arguments={"code": "1+1"}
+        )
+        assert [c.text for c in result.content] == ["added"]
+        assert result.structured_content == {"cellId": "c1"}
+
+    @pytest.mark.asyncio
+    async def test_call_notebook_tool_without_arguments(self, mock_proxy_client):
+        client = self._connected_proxy_client(mock_proxy_client)
+        client.call_tool_mcp = AsyncMock(
+            return_value=CallToolResult(content=[TextContent(type="text", text="[]")])
+        )
+        tool = self._tools(mock_proxy_client)[session.CALL_NOTEBOOK_TOOL_NAME]
+
+        await tool.run({"name": "get_cells"})
+
+        client.call_tool_mcp.assert_called_once_with(name="get_cells", arguments={})
+
+    @pytest.mark.asyncio
+    async def test_call_notebook_tool_error_result(self, mock_proxy_client):
+        client = self._connected_proxy_client(mock_proxy_client)
+        client.call_tool_mcp = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="no such cell")], isError=True
+            )
+        )
+        tool = self._tools(mock_proxy_client)[session.CALL_NOTEBOOK_TOOL_NAME]
+
+        with pytest.raises(ToolError, match="no such cell"):
+            await tool.run({"name": "delete_cell", "arguments": {"cellId": "x"}})
 
 
 class TestColabProxyClient:
@@ -257,6 +468,12 @@ class TestColabSessionProxy:
         assert proxy.proxy_server is not None
         mock_colab_proxy_middleware.assert_called_once()
         mock_tool_injection_middleware.assert_called_once()
+        injected = mock_tool_injection_middleware.call_args.kwargs["tools"]
+        assert [tool.name for tool in injected] == [
+            session.INJECTED_TOOL_NAME,
+            session.LIST_NOTEBOOK_TOOLS_NAME,
+            session.CALL_NOTEBOOK_TOOL_NAME,
+        ]
 
     @pytest.mark.asyncio
     async def test_cleanup(self):
